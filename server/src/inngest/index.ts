@@ -1,14 +1,55 @@
+import { findChunksBySourceId } from "../repository/source-chunk.repository.js";
+import { findSourceById } from "../repository/source.repository.js";
+import {
+    chunkSourceContent,
+    embedAndIndexSource,
+    extractSourceContent,
+    markSourceFailed,
+    markSourceProcessing,
+} from "../services/source-processing.services.js";
 import { inngest } from "./client.js";
 
-const helloWorld = inngest.createFunction(
-    { id: "hello-world", triggers: [{ event: "test/hello.world" }] },
-    async ({ event, step }) => {
-      await step.sleep("wait-a-moment", "1s");
-      return { message: `Hello ${event.data.email}!` };
+export const processSource = inngest.createFunction(
+    {
+        id: "process-source",
+        retries: 3,
+        triggers: [{ event: "source/created" }],
     },
-  );
-  
-  // Add the function to the exported array:
-  export const functions = [
-    helloWorld
-  ];
+    async ({ event, step }) => {
+        const { sourceId } = event.data;
+
+        await step.run("mark-processing", () => markSourceProcessing(sourceId));
+
+        try {
+            const extracted = await step.run("extract-content", () =>
+                extractSourceContent(sourceId)
+            );
+
+            await step.run("chunk-content", () =>
+                chunkSourceContent(sourceId, extracted.text, extracted.pages)
+            );
+
+            const result = await step.run("embed-and-index", async () => {
+                const source = await findSourceById(sourceId);
+                if (!source) {
+                    throw new Error("Source not found");
+                }
+
+                const chunks = await findChunksBySourceId(sourceId);
+                await embedAndIndexSource(source, chunks);
+
+                return { chunkCount: chunks.length };
+            });
+
+            return { sourceId, status: "READY", ...result };
+        } catch (error) {
+            await step.run("mark-failed", async () => {
+                const source = await findSourceById(sourceId);
+                if (source) {
+                    await markSourceFailed(sourceId, error, source.metadata);
+                }
+            });
+            throw error;
+        }
+    }
+);
